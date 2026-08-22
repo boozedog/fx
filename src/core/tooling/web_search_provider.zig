@@ -1,5 +1,6 @@
 const std = @import("std");
 const session_usage = @import("../session/session_usage.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const web_search_policy = @import("web_search_policy.zig");
 

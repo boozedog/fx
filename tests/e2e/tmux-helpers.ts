@@ -21,6 +21,8 @@ const COMPOSER_LINE = /^[ \t]*(?:┃|❯|>)(?:[ \t]|$)/;
 const AUTH_ENV_KEYS = [
   "AI_GATEWAY_API_KEY",
   "VERCEL_OIDC_TOKEN",
+  "OPENAI_API_KEY",
+  "LITELLM_API_KEY",
 ] as const;
 const DEFAULT_UNSET_ENV_KEYS = [
   ...AUTH_ENV_KEYS,
@@ -585,6 +587,13 @@ export class TmuxSession {
       : [
         ";",
         "set-option",
+        "-w",
+        "-t",
+        `${name}:0`,
+        "history-limit",
+        String(Math.max(serverHistoryLines!, minimumHistoryLines)),
+        ";",
+        "set-option",
         "-g",
         "history-limit",
         String(serverHistoryLines!),
@@ -862,6 +871,25 @@ export class TmuxSession {
   }
 
   /**
+   * Current pane title, which is what a terminal renders as the tab label.
+   * fx sets it through OSC 2, so this reads back what the user would see.
+   */
+  async paneTitle(): Promise<string> {
+    try {
+      return execFileSync(
+        "tmux",
+        this.tmuxArgs(["display-message", "-p", "-t", this.name, "#{pane_title}"]),
+        {
+          stdio: "pipe",
+          encoding: "utf-8",
+        },
+      ).trimEnd();
+    } catch {
+      return "";
+    }
+  }
+
+  /**
    * Resize the tmux window. Delivers a real SIGWINCH to fx, exercising the
    * resize pipeline end-to-end. Default post-resize sleep covers the 100 ms
    * debounce in src/main.zig.
@@ -887,6 +915,24 @@ export class TmuxSession {
     } catch {
       return "";
     }
+  }
+
+  /**
+   * Copy subsequent raw pane output to a file. Unlike capture-pane, this
+   * preserves control bytes such as BEL before tmux applies them to its grid.
+   */
+  startPaneOutputCapture(path: string): void {
+    execFileSync(
+      "tmux",
+      this.tmuxArgs([
+        "pipe-pane",
+        "-O",
+        "-t",
+        this.name,
+        `cat >> ${shellQuote(path)}`,
+      ]),
+      { stdio: "pipe" },
+    );
   }
 
   /**

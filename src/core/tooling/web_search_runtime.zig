@@ -1,5 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");

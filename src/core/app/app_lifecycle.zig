@@ -6,13 +6,15 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
+const openai_transport = @import("../gateway/openai_transport.zig");
+const openai_compatible = @import("../../gateway/openai_compatible.zig");
 const input_appearance = @import("../config/input_appearance.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const update_target = @import("../upgrade/update_target.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
@@ -121,6 +123,7 @@ pub const StartupState = struct {
     credential: ?credentials.Credential = null,
     credential_onboarding_skipped: bool = false,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
+    provider: model_provider.ProviderId = .gateway,
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
     model_source: config_runtime.ModelSource = .compiled_default,
@@ -143,14 +146,33 @@ pub const StartupState = struct {
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
     effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
-    sandbox_backend: sandbox.BackendKind = .none,
-    statusline_sandbox: bool = false,
     statusline_context: bool = false,
     statusline_session: bool = false,
+    statusline_workspace: bool = false,
     notification_turn_end: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
     theme_monitor_enabled: bool = false,
+    openai_base_url: []u8 = &.{},
+    openai_api_style: openai_transport.ApiStyle = .chat,
+    profile_openai_api_key: []u8 = &.{},
+
+    pub fn profileOpenAiApiKey(self: *const StartupState) ?[]const u8 {
+        return if (self.profile_openai_api_key.len > 0) self.profile_openai_api_key else null;
+    }
+
+    pub fn takeProfileOpenAiApiKey(self: *StartupState) []u8 {
+        const value = self.profile_openai_api_key;
+        self.profile_openai_api_key = &.{};
+        return value;
+    }
+
+    pub fn openAiCompatibleConfig(self: *const StartupState) openai_compatible.OpenAiCompatibleConfig {
+        return .{
+            .base_url = if (self.openai_base_url.len > 0) self.openai_base_url else openai_transport.default_base_url,
+            .api_style = self.openai_api_style,
+        };
+    }
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
         self.workspace_access.deinit(alloc);
@@ -158,6 +180,8 @@ pub const StartupState = struct {
         if (self.credential) |*credential| credential.deinit(alloc);
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
         if (self.configured_model.len > 0) alloc.free(self.configured_model);
+        if (self.openai_base_url.len > 0) alloc.free(self.openai_base_url);
+        if (self.profile_openai_api_key.len > 0) alloc.free(self.profile_openai_api_key);
         self.permission_rules.deinit(alloc);
         if (self.config_diagnostics.len > 0) {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
@@ -206,6 +230,12 @@ pub const StartupState = struct {
         return value;
     }
 
+    pub fn takeOpenAiBaseUrl(self: *StartupState) []u8 {
+        const value = self.openai_base_url;
+        self.openai_base_url = &.{};
+        return value;
+    }
+
     pub fn takePermissionRules(self: *StartupState) types.PermissionRuleSet {
         const value = self.permission_rules;
         self.permission_rules = .{};
@@ -215,11 +245,11 @@ pub const StartupState = struct {
 
 pub const StartupStatus = struct {
     workspace_root: []u8,
+    provider: model_provider.ProviderId = .gateway,
     selected_model: []const u8,
     owned_selected_model: ?[]u8 = null,
     auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: PermissionMode,
-    sandbox_backend: sandbox.BackendKind = .none,
     agent_step_limit: usize,
     update_channel: update_target.Channel = .stable,
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
@@ -317,19 +347,26 @@ pub fn loadStartupStatus(
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
 
-    const selected_model = try loadStartupStatusModel(alloc, default_model, settings.model);
+    const configured_selection = try configuredProviderSelection(default_model, settings);
+    const selected_model = try loadStartupStatusModel(alloc, configured_selection.model, null);
     errdefer if (selected_model.owned) |model| alloc.free(model);
 
-    var auth_status = try auth_runtime.loadStatusSnapshot(alloc, secret_store, settings.credential_source);
+    var auth_status = try auth_runtime.loadStatusSnapshotForProvider(
+        alloc,
+        secret_store,
+        configured_selection.provider,
+        settings.credential_source,
+        settings.openai_api_key,
+    );
     errdefer auth_status.deinit(alloc);
 
     const result = StartupStatus{
         .workspace_root = workspace_root,
+        .provider = configured_selection.provider,
         .selected_model = selected_model.value,
         .owned_selected_model = selected_model.owned,
         .auth = auth_status,
         .permission_mode = loadPermissionMode(settings.permission_mode),
-        .sandbox_backend = sandbox.backendFromConfig(settings.sandbox),
         .agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps),
         .update_channel = settings.update_channel orelse .stable,
         .config_diagnostics = detailed.diagnostics,
@@ -390,16 +427,46 @@ fn loadStartupStateFromOwnedWorkspace(
         false,
     );
 
-    state.configured_model = try alloc.dupe(u8, settings.model orelse default_model);
+    const configured_selection = try resolveEffectiveProvider(
+        alloc,
+        transport,
+        secret_store,
+        default_model,
+        settings,
+        credential_mode,
+    );
+    state.provider = configured_selection.provider;
+    state.configured_model = try alloc.dupe(u8, configured_selection.model);
     state.model_source = detailed.model_source orelse .compiled_default;
-    state.selected_model = try loadInitialModel(alloc, default_model, settings.model);
+    state.selected_model = try loadInitialModel(alloc, configured_selection.model, null);
     if (hasProcessModelOverride()) state.model_source = .process_override;
+    state.openai_base_url = try alloc.dupe(u8, openai_transport.resolveOpenAiBaseUrlFromSettings(.{
+        .openai_base_url = settings.openai_base_url,
+        .openai_api_key = settings.openai_api_key,
+        .openai_api_style = settings.openai_api_style,
+    }));
+    state.openai_api_style = openai_transport.resolveOpenAiApiStyleFromSettings(.{
+        .openai_base_url = settings.openai_base_url,
+        .openai_api_key = settings.openai_api_key,
+        .openai_api_style = settings.openai_api_style,
+    });
+    if (settings.openai_api_key) |profile_key| {
+        state.profile_openai_api_key = try alloc.dupe(u8, profile_key);
+    }
     state.config_diagnostics = detailed.diagnostics;
     detailed.diagnostics = &.{};
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     if (credential_mode) |mode| {
-        const resolution = try credentials.resolvePreferring(alloc, transport, secret_store, mode, settings.credential_source);
+        const resolution = try credentials.resolveForProvider(
+            alloc,
+            transport,
+            secret_store,
+            mode,
+            state.provider,
+            settings.credential_source,
+            settings.openai_api_key,
+        );
         state.credential = resolution.credential;
         state.stored_key_status = resolution.stored_key_status;
     }
@@ -419,10 +486,9 @@ fn loadStartupStateFromOwnedWorkspace(
     state.startup_scrollback = settings.startup_scrollback orelse true;
     state.effort = settings.effort orelse .auto;
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
-    state.sandbox_backend = sandbox.backendFromConfig(settings.sandbox);
-    state.statusline_sandbox = settings.statusline_sandbox orelse false;
     state.statusline_context = settings.statusline_context orelse false;
     state.statusline_session = settings.statusline_session orelse false;
+    state.statusline_workspace = settings.statusline_workspace orelse false;
     const sound_override = soundEnvOverride();
     const sound_on_override: ?bool = if (sound_override) |level| level != .off else null;
     const max_override: ?bool = if (sound_override) |level| level == .max else null;
@@ -1093,10 +1159,130 @@ fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {
     );
 }
 
+fn configuredProviderSelection(
+    default_model: []const u8,
+    settings: *const config_runtime.Settings,
+) !model_provider.ProviderSelection {
+    const provider = blk: {
+        if (io_mod.getenv("FX_PROVIDER")) |raw| {
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            if (trimmed.len > 0) {
+                if (model_provider.parse(trimmed)) |parsed| break :blk parsed;
+            }
+        }
+        break :blk settings.provider orelse .gateway;
+    };
+    const model = switch (provider) {
+        .gateway => settings.model orelse default_model,
+        .codex => settings.codex_model orelse return error.CodexModelNotSelected,
+        .openai => settings.openai_model orelse return error.OpenAiModelNotSelected,
+        .grok => settings.grok_model orelse return error.GrokModelNotSelected,
+    };
+    return .{ .provider = provider, .model = model };
+}
+
+fn resolveEffectiveProvider(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    settings: *const config_runtime.Settings,
+    credential_mode: ?CredentialLoadMode,
+) !model_provider.ProviderSelection {
+    const configured = try configuredProviderSelection(default_model, settings);
+    if (configured.provider != .gateway) return configured;
+    if (credential_mode == null) return configured;
+
+    const preferred = if (settings.credential_source == .chatgpt_subscription)
+        null
+    else
+        settings.credential_source;
+    const gateway_resolution = try credentials.resolvePreferring(
+        alloc,
+        transport,
+        secret_store,
+        credential_mode.?,
+        preferred,
+    );
+    if (gateway_resolution.credential) |credential| {
+        var owned = credential;
+        owned.deinit(alloc);
+        return configured;
+    }
+
+    if (!credentials.openAiApiKeyConfigured(settings.openai_api_key)) return configured;
+    const model = settings.openai_model orelse configured.model;
+    return .{ .provider = .openai, .model = model };
+}
+
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
     const model = io_mod.getenv("FX_MODEL") orelse return configured orelse default_model;
     const trimmed = std.mem.trim(u8, model, " \t\r\n");
     return if (trimmed.len > 0) trimmed else configured orelse default_model;
+}
+
+test "startup provider chooses only its provider-scoped model" {
+    const gateway_settings = config_runtime.Settings{
+        .model = @constCast("gateway/model"),
+        .provider = .gateway,
+        .codex_model = @constCast("gpt-model"),
+    };
+    const gateway = try configuredProviderSelection("default/model", &gateway_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.provider);
+    try std.testing.expectEqualStrings("gateway/model", gateway.model);
+
+    const codex_settings = config_runtime.Settings{
+        .model = @constCast("gateway/model"),
+        .provider = .codex,
+        .codex_model = @constCast("gpt-model"),
+    };
+    const codex = try configuredProviderSelection("default/model", &codex_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
+    try std.testing.expectEqualStrings("gpt-model", codex.model);
+
+    const missing_codex = config_runtime.Settings{ .provider = .codex };
+    try std.testing.expectError(
+        error.CodexModelNotSelected,
+        configuredProviderSelection("default/model", &missing_codex),
+    );
+
+    const openai_settings = config_runtime.Settings{
+        .model = @constCast("gateway/model"),
+        .provider = .openai,
+        .openai_model = @constCast("gpt-4o"),
+    };
+    const openai = try configuredProviderSelection("default/model", &openai_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.openai, openai.provider);
+    try std.testing.expectEqualStrings("gpt-4o", openai.model);
+
+    const missing_openai = config_runtime.Settings{ .provider = .openai };
+    try std.testing.expectError(
+        error.OpenAiModelNotSelected,
+        configuredProviderSelection("default/model", &missing_openai),
+    );
+}
+
+test "FX_PROVIDER overrides saved provider selection" {
+    var env = try TestEnv.install(std.testing.allocator, &.{
+        .{ .key = "FX_PROVIDER", .value = "openai" },
+    });
+    defer env.deinit();
+
+    const settings = config_runtime.Settings{
+        .provider = .gateway,
+        .model = @constCast("gateway/model"),
+        .openai_model = @constCast("gpt-4o"),
+    };
+    const selected = try configuredProviderSelection("default/model", &settings);
+    try std.testing.expectEqual(model_provider.ProviderId.openai, selected.provider);
+    try std.testing.expectEqualStrings("gpt-4o", selected.model);
+    const grok_settings = config_runtime.Settings{
+        .provider = .grok,
+        .grok_model = @constCast("grok-model"),
+    };
+    const grok = try configuredProviderSelection("default/model", &grok_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
+    try std.testing.expectEqualStrings("grok-model", grok.model);
 }
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {
@@ -1979,7 +2165,6 @@ test "loadStartupState applies core env overrides" {
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
     try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
     try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
-    try std.testing.expectEqual(sandbox.BackendKind.none, state.sandbox_backend);
 }
 
 test "loadStartupState defaults fast mode off and preserves explicit preferences" {
